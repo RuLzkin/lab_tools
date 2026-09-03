@@ -53,9 +53,11 @@ class Synth_Wrapper():
             if str_port is None:
                 raise ValueError("Valid port not found")
         self.synth = SynthHD(str_port)
-        self.synth[0].enable = False
-        self.synth[0].power = 15
-        self.synth[0].frequency = 8.0e9
+        for _channel in [0, 1]:
+            self.synth[_channel].enable = False
+            self.synth[_channel].power = -20.0
+            self.synth[_channel].frequency = 8.0e9
+            self.synth[_channel].phase = 0.0
         logger.info(f"{MSG} Connect to {str_port}")
         try:
             self.input_limit()
@@ -66,17 +68,24 @@ class Synth_Wrapper():
         else:
             logger.info(f"{MSG} load limit list")
 
-    def on_no_feedback(self, power: Optional[float] = None, frequency: Optional[float] = None) -> Tuple[float, float, bool]:
-        """on(power: float | None, frequency: float | None)
+    def on_no_feedback(
+            self,
+            power: Optional[float] = None,
+            frequency: Optional[float] = None,
+            phase: Optional[float] = None,
+            channel: Optional[int] = 0) -> Tuple[float, float, bool, float]:
+        """on(power: float | None, frequency: float | None, phase: float | None, channel: int | None)
 
         If input args are omitted, the previous values are applied
 
         Args:
             power (float, None): [dBm] -40 ~ 0.01 ~ +18
             frequency (float, None): [Hz] 0.01e9 ~ 0.1 ~ 24e9
+            phase (float, None): [deg]
+            channel (int, None): channel number
 
         Returns:
-            self.status() (power, frequency, calibrated)
+            self.status() (power, frequency, calibrated, phase)
 
         Examples:
             >>> synth.on()
@@ -84,22 +93,29 @@ class Synth_Wrapper():
             >>> synth.on(frequency=7.5e9)
         """
         if self.debug:
-            return self.status()
+            return self.status(channel=channel)
         if power is not None:
-            self.synth[0].power = float(power)
+            self.synth[channel].power = float(power)
         if frequency is not None:
-            self.synth[0].frequency = float(frequency)
-        self.synth[0].enable = True
-        time.sleep(0.125)  # for signal rise time
-        return self.status()
+            self.synth[channel].frequency = float(frequency)
+        self.synth[channel].enable = True
+        if phase is not None:
+            self.synth[channel].phase = float(phase)
+        t0 = time.time()
+        while not self.synth[channel].lock_status:
+            if time.time() - t0 > 0.5:
+                logger.warning(f"{MSG} SynthHD PLL lock timeout")
+            time.sleep(0.005)
+        return self.status(channel=channel)
 
-    def off(self) -> None:
+    def off(self, channel: Optional[int] = 0) -> None:
         """off()
 
         that's it
 
         Args:
-            None
+            channel (Optional[int]) (default: 0)
+                if None, both 0 and 1
 
         Returns:
             None
@@ -110,9 +126,13 @@ class Synth_Wrapper():
         """
         if self.debug:
             return
-        self.synth[0].enable = False
+        if channel is None:
+            self.synth[0].enable = False
+            self.synth[1].enable = False
+        else:
+            self.synth[channel].enable = False
 
-    def status(self, flag_ghz=False) -> Tuple[float, float, bool]:
+    def status(self, flag_ghz=False, channel: Optional[int] = 0) -> Tuple[float, float, bool, float]:
         """status()
 
         return the current power and frequency.
@@ -120,25 +140,54 @@ class Synth_Wrapper():
 
         Args:
             flag_ghz (bool, Optional): the unit of the output frequency. False=Hz, True=GHz
+            channel (Optional[int]) (default: 0)
+                if None, both 0 and 1
 
         Returns:
             power (float): [dBm]
             frequency (float): [Hz] or [GHz] (default: [Hz])
             calibrated (float): True(OK) or False(NG)
+            phase (float): [deg]
 
         Examples:
             >>> synth.status()
         """
         if self.debug:
-            return 0, 10e9, True
-        _pow = self.synth[0].power
-        _freq = self.synth[0].frequency
-        _cali = self.synth[0].calibrated
+            return 0, 10e9, True, 0
+        _pow = self.synth[channel].power
+        _freq = self.synth[channel].frequency
+        _cali = self.synth[channel].calibrated
+        _pha = self.synth[channel].phase
         if flag_ghz:
             _freq = _freq * 1e-9
-        return _pow, _freq, _cali
+        return _pow, _freq, _cali, _pha
 
-    def on(self, power: Optional[float] = None, frequency: Optional[float] = None, use_limit: bool = True) -> Tuple[float, float, bool]:
+    def show_status(self):
+        _temp = self.synth.temperature
+        _ena_0 = self.synth[0].enable
+        _ena_1 = self.synth[1].enable
+        _sta_0 = self.status(flag_ghz=True, channel=0)
+        _sta_1 = self.status(flag_ghz=True, channel=1)
+
+        logger.info(f"{MSG} SynthHD Status")
+        logger.info(f"{MSG}  * Model: {self.synth.model}")
+        logger.info(f"{MSG}  * Model Type: {self.synth.model_type}")
+        logger.info(f"{MSG}  * Serial Number: {self.synth.serial_number}")
+        logger.info(f"{MSG}  * Firmware Version: {self.synth.firmware_version}")
+        logger.info(f"{MSG}  * Hardware Version: {self.synth.hardware_version}")
+        logger.info(f"{MSG}  * Reference Mode: {self.synth.reference_mode}")
+        logger.info(f"{MSG}  * Reference Frequency: {self.synth.reference_frequency} Hz")
+        logger.info(f"{MSG}  * Trigger Mode: {self.synth.trigger_mode}")
+        logger.info(f"{MSG}  * Device Temperature: {_temp:.2f} °C")
+        logger.info(f"{MSG}  * Channel 0 - ON: {_ena_0}, Pow: {_sta_0[0]:6.2f} dBm, Freq: {_sta_0[1]:6.2f} GHz, Level: {_sta_0[2]}, Phase: {_sta_0[3]:7.2f} deg")
+        logger.info(f"{MSG}  * Channel 1 - ON: {_ena_1}, Pow: {_sta_1[0]:6.2f} dBm, Freq: {_sta_1[1]:6.2f} GHz, Level: {_sta_1[2]}, Phase: {_sta_1[3]:7.2f} deg")
+
+    def on(self,
+           power: Optional[float] = None,
+           frequency: Optional[float] = None,
+           phase: Optional[float] = None,
+           use_limit: bool = True,
+           channel: Optional[int] = 0) -> Tuple[float, float, bool, float]:
         """on(power: float | None, frequency: float | None)
 
         If input args are omitted, the previous values are applied
@@ -146,10 +195,12 @@ class Synth_Wrapper():
         Args:
             power (float, None): [dBm] -40 ~ 0.01 ~ +18
             frequency (float, None): [Hz] 0.01e9 ~ 0.1 ~ 24e9
+            phase (float, None): [deg]
             use_limit (bool)
+            channel (int, None): channel number
 
         Returns:
-            self.status() (power, frequency, calibrated)
+            self.status() (power, frequency, calibrated, phase)
 
         Examples:
             >>> synth.on()
@@ -157,11 +208,13 @@ class Synth_Wrapper():
             >>> synth.on(frequency=7.5e9)
         """
         if self.debug:
-            return self.status()
+            return self.status(channel=channel)
+        # frequency
         if frequency is not None:
-            self.synth[0].frequency = float(frequency)
+            self.synth[channel].frequency = float(frequency)
+        # power
         if power is None:
-            power = self.synth[0].power
+            power = self.synth[channel].power
         else:
             if use_limit and frequency is not None:
                 try:
@@ -171,20 +224,31 @@ class Synth_Wrapper():
                     # print("Power limit not found")
                     pow_lim = 15
                 power = min(power, pow_lim)
-            self.synth[0].power = float(power)
-        self.synth[0].enable = True
-        is_calibrated = self.synth[0].calibrated
+            self.synth[channel].power = float(power)
+        # on
+        if not self.synth[channel].enable:
+            self.synth[channel].enable = True
+        t0 = time.time()
+        while not self.synth[channel].lock_status:
+            if time.time() - t0 > 0.5:
+                logger.warning(f"{MSG} SynthHD PLL lock timeout")
+            time.sleep(0.005)
+        # phase (after enable)
+        if phase is not None:
+            self.synth[channel].phase = float(phase)
+
+        is_calibrated = self.synth[channel].calibrated
         step_power = 0.1
         if power is None:
             raise ValueError("Power value is invalid")
         _sign = (power >= 0) * 2 - 1
         while not is_calibrated:
-            self.synth[0].power -= step_power * _sign
-            # print("not calibrated:", self.synth[0].power)
-            time.sleep(0.1)  # for signal rise time
-            is_calibrated = self.synth[0].calibrated
-        time.sleep(0.01)  # for signal rise time
-        return self.status()
+            self.synth[channel].power -= step_power * _sign
+            # print("not calibrated:", self.synth[channel].power)
+            time.sleep(0.005)  # for signal rise time
+            is_calibrated = self.synth[channel].calibrated
+        # time.sleep(0.01)  # for signal rise time
+        return self.status(channel=channel)
 
     def output_limit(self):
         with open(MODULE_DIR / "lib_synthhd_power.wf", "wb") as f:
@@ -195,13 +259,13 @@ class Synth_Wrapper():
             _list_load = pickle.load(f)
         self.list_lim_freq, self.list_lim_pow = _list_load
 
-    def measure_limit(self, list_hz_freq: list):
+    def measure_limit(self, list_hz_freq: list, channel: Optional[int] = 0):
         """measure_limit
         """
         self.list_lim_freq = []
         self.list_lim_pow = []
         for _i, _freq in tenumerate(list_hz_freq):
-            _pow, _, _ = self.on(15, _freq, use_limit=False)
+            _pow, _, _, _ = self.on(15, _freq, use_limit=False, channel=channel)
             time.sleep(0.1)
             self.off()
             self.list_lim_freq.append(_freq)
@@ -232,16 +296,20 @@ class Synth_Wrapper():
 
 if __name__ == "__main__":
     synth = Synth_Wrapper("COM3")
-    synth.on(15, 8e9)
-    synth.off()
+    status = synth.on(0, 8e9, 0, channel=0)
+    synth.off(channel=0)
+
+    synth.show_status()
 
     """Limiter"""
+    # import numpy as np
     # vec_freq = np.arange(4.5, 24.001, 0.1) * 1e9
     # synth.measure_limit(vec_freq.tolist())
     # synth.output_limit()
 
     """Limiter Check"""
+    import numpy as np
     from matplotlib import pyplot as plt
     plt.figure()
-    plt.plot(synth.list_lim_freq, synth.list_lim_pow)
+    plt.plot(np.array(synth.list_lim_freq) * 1e-9, synth.list_lim_pow)
     plt.show()
