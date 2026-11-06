@@ -25,9 +25,34 @@ AXES = ("X", "Y", "Z")
 UNIT = "U"  # move_abs に渡す単位 (U: um)
 
 
-def quantize(target):
-    """SHRC-203 は U 単位で小数点以下を含む値を受け付けない (ビープ音でエラー) ため整数 um に丸める"""
-    return [float(round(v)) for v in target]
+DEFAULT_RESOLUTION_UM = 2.0  # 分解能が読めなかった場合の値
+
+
+def quantize(target, resolution):
+    """目標値を各軸の分解能 [um] の整数倍に丸める
+
+    SHRC-203 は U 単位で分解能の倍数でない値を受け付けない (ビープ音でエラー) ため。
+    """
+    out = []
+    for v, r in zip(target, resolution):
+        r = r if r > 0 else 1.0
+        out.append(round(round(v / r) * r, 6))
+    return out
+
+
+def read_resolution(shrc: Shrc203):
+    """分解能 [um/pulse] と分割数を読み込む
+
+    ?:PW (TravelPerPulse) は 1 パルスあたりの移動量を nm 単位で返す
+    (実機で 2000,2000,2000 → 2 um 刻みのみ受け付け) ので 1/1000 して um にする。
+    """
+    pw = shrc.TravelPerPulse()
+    res = [v / 1000.0 for v in pw[:3]]
+    try:
+        div = [int(v) for v in shrc.NumberOfDivisions()[:3]]
+    except Exception:
+        div = None
+    return res, div
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +117,15 @@ class SimDevice:
         time.sleep(0.002)
         if cmd.startswith("A:"):
             vals = re.findall(r"([+-])[A-Z]([0-9.]+)", cmd)
-            self._pending = [float(v) * (-1 if s == "-" else 1) for s, v in vals[:3]]
+            vals = [float(v) * (-1 if s == "-" else 1) for s, v in vals[:3]]
+            if any(abs(v / 2.0 - round(v / 2.0)) > 1e-9 for v in vals):
+                return "NG"  # 実機同様、分解能 (2 um) の倍数以外は受け付けない
+            self._pending = vals
             return "OK"
+        if cmd.startswith("?:PW"):
+            return "2000,2000,2000"
+        if cmd.startswith("?:SW"):
+            return "2,2,2"
         if cmd.startswith("G:"):
             self._go(self._pending)
             return "OK"
@@ -166,6 +198,8 @@ class Shrc203GUI:
         self.simulate = tk.BooleanVar(value=False)
         self.device_index = tk.StringVar(value="")
         self.step = [tk.DoubleVar(value=v) for v in (100.0, 100.0, 100.0)]
+        self.resolution = [DEFAULT_RESOLUTION_UM] * 3
+        self.res_text = [tk.StringVar(value=f"{DEFAULT_RESOLUTION_UM:g}") for _ in AXES]
         self.invert = [tk.BooleanVar(value=False) for _ in AXES]
         self.abs_entry = [tk.DoubleVar(value=0.0) for _ in AXES]
         self.range_min = [tk.DoubleVar(value=-50000.0), tk.DoubleVar(value=-50000.0)]
@@ -224,6 +258,7 @@ class Shrc203GUI:
         ttk.Label(f, text="軸").grid(row=0, column=0)
         ttk.Label(f, text="ステップ [um]").grid(row=0, column=1)
         ttk.Label(f, text="反転").grid(row=0, column=4)
+        ttk.Label(f, text="分解能 [um]").grid(row=0, column=5)
         for i, ax in enumerate(AXES):
             ttk.Label(f, text=ax).grid(row=i + 1, column=0)
             ttk.Entry(f, textvariable=self.step[i], width=10).grid(row=i + 1, column=1)
@@ -232,6 +267,7 @@ class Shrc203GUI:
             ttk.Button(f, text="+", width=3,
                        command=lambda i=i: self.move_rel(i, +1)).grid(row=i + 1, column=3)
             ttk.Checkbutton(f, variable=self.invert[i]).grid(row=i + 1, column=4)
+            ttk.Label(f, textvariable=self.res_text[i]).grid(row=i + 1, column=5)
 
         # 絶対値移動
         f = ttk.LabelFrame(left, text="絶対値移動 [um]", padding=6)
@@ -311,7 +347,11 @@ class Shrc203GUI:
         def task():
             try:
                 shrc = connect_shrc203(simulate=sim, num_device=num)
-                self.events.put(("connected", shrc))
+                try:
+                    res = read_resolution(shrc)
+                except Exception as e:
+                    res = e
+                self.events.put(("connected", (shrc, res)))
             except Exception as e:
                 self.events.put(("connect_error", e))
         threading.Thread(target=task, daemon=True).start()
@@ -355,7 +395,7 @@ class Shrc203GUI:
         self._submit("rel", delta)
 
     def move_abs(self, target):
-        target = quantize(target)
+        target = quantize(target, self.resolution)
         if self._submit("abs", target):
             self.target = target
             self.redraw_map()
@@ -417,11 +457,11 @@ class Shrc203GUI:
                     raise RuntimeError("未接続")
                 if kind == "rel":
                     pos, _ = parse_position(shrc.device.query("Q:Su"))
-                    target = quantize([p + d for p, d in zip(pos, args[0])])
+                    target = quantize([p + d for p, d in zip(pos, args[0])], self.resolution)
                     self.events.put(("target", target))
                     shrc.move_abs(target, [UNIT] * 3)
                 elif kind == "abs":
-                    shrc.move_abs(quantize(args[0]), [UNIT] * 3)
+                    shrc.move_abs(quantize(args[0], self.resolution), [UNIT] * 3)
                 elif kind == "home":
                     shrc.homeposition()
                 self.events.put(("done", None))
@@ -450,9 +490,17 @@ class Shrc203GUI:
             if kind == "pos":
                 latest_pos = data
             elif kind == "connected":
-                self.shrc = data
+                self.shrc, res = data
                 self.btn_connect.config(text="切断", state=tk.NORMAL)
                 self.state_text.set("接続しました (シミュレーション)" if self.simulate.get() else "接続しました")
+                if isinstance(res, Exception):
+                    self.resolution = [DEFAULT_RESOLUTION_UM] * 3
+                    messagebox.showwarning(
+                        "分解能", f"分解能の読み込みに失敗しました。{DEFAULT_RESOLUTION_UM:g} um として扱います。\n{res}")
+                else:
+                    self.resolution, div = res
+                for i, r in enumerate(self.resolution):
+                    self.res_text[i].set(f"{r:g}" + (f" (分割{res[1][i]})" if not isinstance(res, Exception) and res[1] else ""))
             elif kind == "connect_error":
                 self.btn_connect.config(state=tk.NORMAL)
                 self.state_text.set("接続失敗")
