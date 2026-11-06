@@ -25,6 +25,11 @@ AXES = ("X", "Y", "Z")
 UNIT = "U"  # move_abs に渡す単位 (U: um)
 
 
+def quantize(target):
+    """SHRC-203 は U 単位で小数点以下を含む値を受け付けない (ビープ音でエラー) ため整数 um に丸める"""
+    return [float(round(v)) for v in target]
+
+
 # ---------------------------------------------------------------------------
 # デバイス周り
 # ---------------------------------------------------------------------------
@@ -350,8 +355,9 @@ class Shrc203GUI:
         self._submit("rel", delta)
 
     def move_abs(self, target):
-        if self._submit("abs", list(target)):
-            self.target = list(target)
+        target = quantize(target)
+        if self._submit("abs", target):
+            self.target = target
             self.redraw_map()
 
     def move_abs_entry(self):
@@ -364,7 +370,7 @@ class Shrc203GUI:
 
     def copy_current(self):
         for v, p in zip(self.abs_entry, self.pos):
-            v.set(round(p, 2))
+            v.set(round(p))
 
     def home(self):
         if self.shrc is None:
@@ -411,11 +417,11 @@ class Shrc203GUI:
                     raise RuntimeError("未接続")
                 if kind == "rel":
                     pos, _ = parse_position(shrc.device.query("Q:Su"))
-                    target = [p + d for p, d in zip(pos, args[0])]
+                    target = quantize([p + d for p, d in zip(pos, args[0])])
                     self.events.put(("target", target))
                     shrc.move_abs(target, [UNIT] * 3)
                 elif kind == "abs":
-                    shrc.move_abs(list(args[0]), [UNIT] * 3)
+                    shrc.move_abs(quantize(args[0]), [UNIT] * 3)
                 elif kind == "home":
                     shrc.homeposition()
                 self.events.put(("done", None))
@@ -568,7 +574,7 @@ class Shrc203GUI:
         x, y = self._from_canvas(event.x, event.y, g)
         if not (xmin <= x <= xmax and ymin <= y <= ymax):
             return
-        self.move_abs([round(x, 2), round(y, 2), self.pos[2]])
+        self.move_abs([x, y, self.pos[2]])
 
     # ---------------- 終了 ----------------
     def on_close(self):
